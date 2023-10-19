@@ -97,6 +97,30 @@ func (h configHandler) FindUser(userName string, searchByUPN bool) (f bool, u co
 	return found, user, nil
 }
 
+func (h configHandler) FindUserByTenant(tenant string, userName string, searchByUPN bool) (f bool, u config.User, err error) {
+	user := config.User{}
+	found := false
+
+	for _, u := range h.cfg.Users {
+		if u.Tenant != tenant {
+			continue
+		}
+		if searchByUPN {
+			if strings.EqualFold(u.Mail, userName) {
+				found = true
+				user = u
+			}
+		} else {
+			if strings.EqualFold(u.Name, userName) {
+				found = true
+				user = u
+			}
+		}
+	}
+
+	return found, user, nil
+}
+
 func (h configHandler) FindGroup(groupName string) (f bool, g config.Group, err error) {
 	// TODO Does g get erased, and above does u get erased?
 	// TODO and what about f?
@@ -113,8 +137,19 @@ func (h configHandler) FindGroup(groupName string) (f bool, g config.Group, err 
 
 func (h configHandler) FindPosixAccounts(hierarchy string) (entrylist []*ldap.Entry, err error) {
 	entries := []*ldap.Entry{}
+	tenant, userName := getTenantUserByHierarchy(hierarchy)
 
 	for _, u := range h.cfg.Users {
+		if u.Syncer {
+			continue
+		}
+		if tenant != "" && u.Tenant != tenant {
+			continue
+		}
+
+		if userName != "" && u.Name != userName {
+			continue
+		}
 		attrs := []*ldap.EntryAttribute{}
 		attrs = append(attrs, &ldap.EntryAttribute{Name: h.backend.NameFormat, Values: []string{u.Name}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "uid", Values: []string{u.Name}})
@@ -127,7 +162,7 @@ func (h configHandler) FindPosixAccounts(hierarchy string) (entrylist []*ldap.En
 			attrs = append(attrs, &ldap.EntryAttribute{Name: "sn", Values: []string{u.SN}})
 		}
 
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "ou", Values: []string{h.getGroupName(u.PrimaryGroup)}})
+		attrs = append(attrs, &ldap.EntryAttribute{Name: "ou", Values: []string{h.getTenantGroupName(tenant, u.PrimaryGroup)}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "uidNumber", Values: []string{fmt.Sprintf("%d", u.UIDNumber)}})
 
 		if u.Disabled {
@@ -141,7 +176,7 @@ func (h configHandler) FindPosixAccounts(hierarchy string) (entrylist []*ldap.En
 			attrs = append(attrs, &ldap.EntryAttribute{Name: "userPrincipalName", Values: []string{u.Mail}})
 		}
 
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"posixAccount", "shadowAccount"}})
+		attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"posixAccount"}})
 
 		if len(u.LoginShell) > 0 {
 			attrs = append(attrs, &ldap.EntryAttribute{Name: "loginShell", Values: []string{u.LoginShell}})
@@ -158,15 +193,15 @@ func (h configHandler) FindPosixAccounts(hierarchy string) (entrylist []*ldap.En
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "description", Values: []string{fmt.Sprintf("%s", u.Name)}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "gecos", Values: []string{fmt.Sprintf("%s", u.Name)}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "gidNumber", Values: []string{fmt.Sprintf("%d", u.PrimaryGroup)}})
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "memberOf", Values: h.getGroupDNs(append(u.OtherGroups, u.PrimaryGroup))})
+		attrs = append(attrs, &ldap.EntryAttribute{Name: "memberOf", Values: h.getTenantGroupDNs(tenant, append(u.OtherGroups, u.PrimaryGroup))})
 
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowExpire", Values: []string{"-1"}})
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowFlag", Values: []string{"134538308"}})
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowInactive", Values: []string{"-1"}})
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowLastChange", Values: []string{"11000"}})
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowMax", Values: []string{"99999"}})
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowMin", Values: []string{"-1"}})
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowWarning", Values: []string{"7"}})
+		//attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowExpire", Values: []string{"-1"}})
+		//attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowFlag", Values: []string{"134538308"}})
+		//attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowInactive", Values: []string{"-1"}})
+		//attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowLastChange", Values: []string{"11000"}})
+		//attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowMax", Values: []string{"99999"}})
+		//attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowMin", Values: []string{"-1"}})
+		//attrs = append(attrs, &ldap.EntryAttribute{Name: "shadowWarning", Values: []string{"7"}})
 
 		if len(u.SSHKeys) > 0 {
 			attrs = append(attrs, &ldap.EntryAttribute{Name: h.backend.SSHKeyAttr, Values: u.SSHKeys})
@@ -192,11 +227,12 @@ func (h configHandler) FindPosixAccounts(hierarchy string) (entrylist []*ldap.En
 			}
 		}
 		var dn string
-		if hierarchy == "" {
-			dn = fmt.Sprintf("%s=%s,%s=%s,%s", h.backend.NameFormat, u.Name, h.backend.GroupFormat, h.getGroupName(u.PrimaryGroup), h.backend.BaseDN)
-		} else {
-			dn = fmt.Sprintf("%s=%s,%s=%s,%s,%s", h.backend.NameFormat, u.Name, h.backend.GroupFormat, h.getGroupName(u.PrimaryGroup), hierarchy, h.backend.BaseDN)
+
+		dn = fmt.Sprintf("%s=%s,%s,%s", h.backend.NameFormat, u.Name, hierarchy, h.backend.BaseDN)
+		if userName != "" {
+			dn = fmt.Sprintf("%s,%s", hierarchy, h.backend.BaseDN)
 		}
+
 		entries = append(entries, &ldap.Entry{DN: dn, Attributes: attrs})
 	}
 
@@ -204,24 +240,35 @@ func (h configHandler) FindPosixAccounts(hierarchy string) (entrylist []*ldap.En
 }
 
 func (h configHandler) FindPosixGroups(hierarchy string) (entrylist []*ldap.Entry, err error) {
-	asGroupOfUniqueNames := hierarchy == "ou=groups"
-
+	//asGroupOfUniqueNames := hierarchy == "ou=groups"
+	tenant, group := getTenantGroupByHierarchy(hierarchy)
 	entries := []*ldap.Entry{}
 
 	for _, g := range h.cfg.Groups {
+		if tenant != "" && g.Tenant != tenant {
+			continue
+		}
+
+		if group != "" && g.Name != group {
+			continue
+		}
 		attrs := []*ldap.EntryAttribute{}
 		attrs = append(attrs, &ldap.EntryAttribute{Name: h.backend.GroupFormat, Values: []string{g.Name}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "uid", Values: []string{g.Name}})
+		attrs = append(attrs, &ldap.EntryAttribute{Name: "cn", Values: []string{g.Name}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "description", Values: []string{fmt.Sprintf("%s", g.Name)}})
 		attrs = append(attrs, &ldap.EntryAttribute{Name: "gidNumber", Values: []string{fmt.Sprintf("%d", g.GIDNumber)}})
-		attrs = append(attrs, &ldap.EntryAttribute{Name: "uniqueMember", Values: h.getGroupMemberDNs(g.GIDNumber)})
-		if asGroupOfUniqueNames {
-			attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"groupOfUniqueNames", "top"}})
-		} else {
-			attrs = append(attrs, &ldap.EntryAttribute{Name: "memberUid", Values: h.getGroupMemberIDs(g.GIDNumber)})
-			attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"posixGroup", "top"}})
-		}
+		attrs = append(attrs, &ldap.EntryAttribute{Name: "uniqueMember", Values: h.getTenantGroupMemberDNs(tenant, g.GIDNumber)})
+		//if asGroupOfUniqueNames {
+		//	attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"groupOfUniqueNames", "top"}})
+		//} else {
+		attrs = append(attrs, &ldap.EntryAttribute{Name: "memberUid", Values: h.getTenantGroupMemberIDs(tenant, g.GIDNumber)})
+		attrs = append(attrs, &ldap.EntryAttribute{Name: "objectClass", Values: []string{"posixGroup", "top"}})
+		//}
 		dn := fmt.Sprintf("%s=%s,%s,%s", h.backend.GroupFormat, g.Name, hierarchy, h.backend.BaseDN)
+		if group != "" {
+			dn = fmt.Sprintf("%s,%s", hierarchy, h.backend.BaseDN)
+		}
 		entries = append(entries, &ldap.Entry{DN: dn, Attributes: attrs})
 	}
 
@@ -239,7 +286,7 @@ func (h configHandler) getGroupMemberDNs(gid int) []string {
 	if h.cfg.Behaviors.LegacyVersion > 0 && h.cfg.Behaviors.LegacyVersion <= 20100 {
 		insertOuUsers = ""
 	} else {
-		insertOuUsers = ",ou=users"
+		insertOuUsers = ",ou=users,ou=tenant1"
 	}
 	members := make(map[string]bool)
 	for _, u := range h.cfg.Users {

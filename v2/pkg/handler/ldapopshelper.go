@@ -5,13 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"github.com/rs/zerolog"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/GeertJohan/yubigo"
 	"github.com/glauth/glauth/v2/pkg/config"
@@ -29,7 +30,7 @@ type LDAPOpsHandler interface {
 	GetLog() *zerolog.Logger
 	GetCfg() *config.Config
 	GetYubikeyAuth() *yubigo.YubiAuth
-
+	FindUserByTenant(tenant string, userName string, searchByUPN bool) (f bool, u config.User, err error)
 	FindUser(userName string, searchByUPN bool) (f bool, u config.User, err error)
 	FindGroup(groupName string) (f bool, g config.Group, err error)
 	FindPosixAccounts(hierarchy string) (entrylist []*ldap.Entry, err error)
@@ -77,7 +78,7 @@ func (l LDAPOpsHelper) Bind(h LDAPOpsHandler, bindDN, bindSimplePw string, conn 
 		return ldap.LDAPResultSuccess, nil
 	}
 
-	user, ldapcode := l.findUser(h, bindDN, true /* checkGroup */)
+	user, ldapcode := l.findUser(h, bindDN, false /* checkGroup */)
 	if ldapcode != ldap.LDAPResultSuccess {
 		return ldapcode, nil
 	}
@@ -271,13 +272,22 @@ func (l LDAPOpsHelper) Search(h LDAPOpsHandler, bindDN string, searchReq ldap.Se
 	case ldap.LDAPResultSuccess:
 		return ldap.ServerSearchResult{Entries: entries, Referrals: []string{}, Controls: []ldap.Control{}, ResultCode: ldapcode}, nil
 	}
-
-	switch entries, ldapcode := l.searchMaybeTopLevelGroupsNode(h, baseDN, searchBaseDN, searchReq); ldapcode {
+	switch entries, ldapcode := l.searchMaybeTenantLevelNodes(h, baseDN, searchBaseDN, searchReq); ldapcode {
 	case ldap.LDAPResultSuccess:
 		return ldap.ServerSearchResult{Entries: entries, Referrals: []string{}, Controls: []ldap.Control{}, ResultCode: ldapcode}, nil
 	}
 
-	switch entries, ldapcode := l.searchMaybeTopLevelUsersNode(h, baseDN, searchBaseDN, searchReq); ldapcode {
+	switch entries, ldapcode := l.searchMaybeTenantLevelSyncer(h, baseDN, searchBaseDN, searchReq); ldapcode {
+	case ldap.LDAPResultSuccess:
+		return ldap.ServerSearchResult{Entries: entries, Referrals: []string{}, Controls: []ldap.Control{}, ResultCode: ldapcode}, nil
+	}
+
+	switch entries, ldapcode := l.searchMaybeTopTenantLevelGroupsNode(h, baseDN, searchBaseDN, searchReq); ldapcode {
+	case ldap.LDAPResultSuccess:
+		return ldap.ServerSearchResult{Entries: entries, Referrals: []string{}, Controls: []ldap.Control{}, ResultCode: ldapcode}, nil
+	}
+
+	switch entries, ldapcode := l.searchMaybeTopTenantLevelUsersNode(h, baseDN, searchBaseDN, searchReq); ldapcode {
 	case ldap.LDAPResultSuccess:
 		return ldap.ServerSearchResult{Entries: entries, Referrals: []string{}, Controls: []ldap.Control{}, ResultCode: ldapcode}, nil
 	}
@@ -405,21 +415,23 @@ func (l LDAPOpsHelper) searchMaybeTopLevelNodes(h LDAPOpsHandler, baseDN string,
 	if searchReq.Scope == ldap.ScopeBaseObject || searchReq.Scope == ldap.ScopeWholeSubtree {
 		entries = append(entries, l.topLevelRootNode(searchBaseDN))
 	}
-	entries = append(entries, l.topLevelGroupsNode(searchBaseDN, "groups"))
-	entries = append(entries, l.topLevelUsersNode(searchBaseDN))
-	if searchReq.Scope == ldap.ScopeWholeSubtree {
-		groupentries, err := h.FindPosixGroups("ou=users")
-		if err != nil {
-			return nil, ldap.LDAPResultOperationsError
-		}
-		entries = append(entries, groupentries...)
+	//	entries = append(entries, l.topLevelGroupsNode(searchBaseDN, "groups"))
+	entries = append(entries, l.topLevelTenantsNode(h, searchBaseDN)...)
 
-		userentries, err := h.FindPosixAccounts("ou=users")
-		if err != nil {
-			return nil, ldap.LDAPResultOperationsError
-		}
-		entries = append(entries, userentries...)
-	}
+	//entries = append(entries, l.topLevelUsersNode(searchBaseDN))
+	//if searchReq.Scope == ldap.ScopeWholeSubtree {
+	//	groupentries, err := h.FindPosixGroups("ou=users")
+	//	if err != nil {
+	//		return nil, ldap.LDAPResultOperationsError
+	//	}
+	//	entries = append(entries, groupentries...)
+	//
+	//	userentries, err := h.FindPosixAccounts("ou=users")
+	//	if err != nil {
+	//		return nil, ldap.LDAPResultOperationsError
+	//	}
+	//	entries = append(entries, userentries...)
+	//}
 	stats.Frontend.Add("search_successes", 1)
 	h.GetLog().Info().Str("filter", searchReq.Filter).Msg("AP: Top-Level Browse OK")
 	return entries, ldap.LDAPResultSuccess
@@ -484,14 +496,15 @@ func (l LDAPOpsHelper) searchMaybePosixGroups(h LDAPOpsHandler, baseDN string, s
 	hierarchy := "ou=groups"
 	if filterEntity != "posixgroup" {
 		bits := strings.Split(strings.Replace(searchBaseDN, baseDN, "", 1), ",")
-		if len(bits) != 3 || (bits[1] != "ou=groups" && bits[1] != "ou=users") {
+		if len(bits) < 4 || (bits[0] != "ou=groups" && bits[1] != "ou=groups") {
 			return nil, ldap.LDAPResultOther // OK
 		}
-		hierarchy = bits[1]
+		hierarchy = fmt.Sprintf("%s,%s,%s", bits[0], bits[1], bits[2])
 	}
+
 	h.GetLog().Info().Str("special case", "posix groups").Msg("Search request")
 	entries := []*ldap.Entry{}
-	if searchReq.Scope == ldap.ScopeBaseObject || searchReq.Scope == ldap.ScopeWholeSubtree {
+	if searchReq.Scope == ldap.ScopeBaseObject || searchReq.Scope == ldap.ScopeWholeSubtree || searchReq.Scope == ldap.ScopeSingleLevel {
 		groupentries, err := h.FindPosixGroups(hierarchy)
 		if err != nil {
 			return nil, ldap.LDAPResultOperationsError
@@ -523,11 +536,7 @@ func (l LDAPOpsHelper) searchMaybePosixAccounts(h LDAPOpsHandler, baseDN string,
 		return nil, ldap.LDAPResultOther // OK
 	}
 
-	// FixUp: we may be in the process of browsing users from a group ou
-	hierarchyString := ""
-	if strings.HasSuffix(searchBaseDN, fmt.Sprintf("ou=users,%s", baseDN)) {
-		hierarchyString = "ou=users"
-	}
+	hierarchyString := strings.TrimSuffix(searchBaseDN, fmt.Sprintf(",%s", baseDN))
 
 	unscopedEntries, err := h.FindPosixAccounts(hierarchyString)
 	if err != nil {
@@ -605,7 +614,7 @@ func (l LDAPOpsHelper) findUser(h LDAPOpsHandler, bindDN string, checkGroup bool
 	// Not using mail.ParseAddress/1 because we would allow incorrectly formatted UPNs
 	if emailmatcher.MatchString(bindDN) {
 		var foundUser bool // = false
-		foundUser, user, _ = h.FindUser(bindDN, true)
+		foundUser, user, _ = h.FindUserByTenant("", bindDN, true)
 		if !foundUser {
 			h.GetLog().Info().Str("userprincipalname", bindDN).Msg("User not found")
 			return nil, ldap.LDAPResultInvalidCredentials
@@ -617,14 +626,21 @@ func (l LDAPOpsHelper) findUser(h LDAPOpsHandler, bindDN string, checkGroup bool
 			// h.GetLog().Warning(fmt.Sprintf("Bind Error: BindDN %s not our BaseDN %s", bindDN, baseDN))
 			return nil, ldap.LDAPResultInvalidCredentials
 		}
+		// cn=syncer,ou=tenant2,dc=glauth,dc=com
+		// cn=admin,dc=glauth,dc=com
+		// cn=lizw,ou=users,ou=tenant2,dc=glauth,dc=com
 		parts := strings.Split(strings.TrimSuffix(bindDN, baseDN), ",")
 		groupName := ""
 		userName := ""
+		tenant := ""
 		if len(parts) == 1 {
 			userName = strings.TrimPrefix(parts[0], h.GetBackend().NameFormat+"=")
-		} else if len(parts) == 2 || (len(parts) == 3 && parts[2] == "ou=users") {
+		} else if len(parts) == 2 {
 			userName = strings.TrimPrefix(parts[0], h.GetBackend().NameFormat+"=")
-			groupName = strings.TrimPrefix(parts[1], h.GetBackend().GroupFormat+"=")
+			tenant = strings.TrimPrefix(parts[1], "ou=")
+		} else if len(parts) == 3 && parts[1] == "ou=users" {
+			userName = strings.TrimPrefix(parts[0], h.GetBackend().NameFormat+"=")
+			tenant = strings.TrimPrefix(parts[2], "ou=")
 		} else {
 			h.GetLog().Info().Str("binddn", bindDN).Int("numparts", len(parts)).Msg("BindDN should have only one or two parts")
 			for _, part := range parts {
@@ -635,7 +651,7 @@ func (l LDAPOpsHelper) findUser(h LDAPOpsHandler, bindDN string, checkGroup bool
 
 		// find the user
 		var foundUser bool // = false
-		foundUser, user, _ = h.FindUser(userName, false)
+		foundUser, user, _ = h.FindUserByTenant(tenant, userName, false)
 		if !foundUser {
 			h.GetLog().Info().Str("username", userName).Msg("User not found")
 			return nil, ldap.LDAPResultInvalidCredentials
@@ -667,6 +683,11 @@ func (l LDAPOpsHelper) checkCapability(user config.User, action string, objects 
 	for _, capability := range user.Capabilities {
 		if capability.Action == action {
 			for _, object := range objects {
+				if strings.HasPrefix(capability.Object, "*,") {
+					if strings.HasSuffix(object, strings.TrimPrefix(capability.Object, "*,")) {
+						return true
+					}
+				}
 				if capability.Object == object {
 					return true
 				}

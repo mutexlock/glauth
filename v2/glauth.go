@@ -3,20 +3,10 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"net/http"
-	"os"
-	"os/signal"
-	"path/filepath"
-	"reflect"
-	"strings"
-	"syscall"
-	"time"
-
 	"github.com/GeertJohan/yubigo"
 	"github.com/arl/statsviz"
 	docopt "github.com/docopt/docopt-go"
 	"github.com/fsnotify/fsnotify"
-	"github.com/glauth/glauth/v2/internal/version"
 	"github.com/glauth/glauth/v2/pkg/config"
 	"github.com/glauth/glauth/v2/pkg/frontend"
 	"github.com/glauth/glauth/v2/pkg/logging"
@@ -27,7 +17,21 @@ import (
 	"github.com/rs/zerolog"
 	"gopkg.in/amz.v3/aws"
 	"gopkg.in/amz.v3/s3"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"time"
 )
+
+// Set with buildtime vars
+var LastGitTag string
+var BuildTime string
+var GitCommit string
+var GitClean string
+var GitBranch string
+var GitTagIsCommit string
 
 const programName = "glauth"
 
@@ -61,6 +65,48 @@ var (
 	activeConfig = &config.Config{}
 )
 
+// Reads builtime vars and returns a full string containing info about
+// the currently running version of the software. Primarily used by the
+// --version flag at runtime.
+func getVersionString() string {
+
+	var versionstr string
+
+	versionstr = "GLauth"
+
+	// Notate the git context of the build
+	switch {
+	// If a release, use the tag
+	case GitClean == "1" && GitTagIsCommit == "1":
+		versionstr += " " + LastGitTag + "\n\n"
+
+	// If this branch had a tag before, mention the branch and the tag to give a rough idea of the base version
+	case len(GitBranch) > 1 && len(LastGitTag) > 1:
+		versionstr += "\nNon-release build from branch " + GitBranch + ", based on tag " + LastGitTag + "\n\n"
+
+	// If no previous tag specified, just mention the branch
+	case len(GitBranch) > 1:
+		versionstr += "\nNon-release build from branch " + GitBranch + "\n\n"
+
+	// Fallback message, if all else fails
+	default:
+		versionstr += "\nNon-release build\n\n"
+	}
+
+	// Include build time
+	if len(BuildTime) > 1 {
+		versionstr += "Build time: " + BuildTime + "\n"
+	}
+
+	// Add commit hash
+	if GitClean == "1" && len(GitCommit) > 1 {
+		versionstr += "Commit: " + GitCommit + "\n"
+	}
+
+	return versionstr
+
+}
+
 func main() {
 	if err := parseArgs(); err != nil {
 		fmt.Println("Could not parse command-line arguments")
@@ -89,7 +135,7 @@ func main() {
 
 func startService() {
 	// stats
-	stats.General.Set("version", stats.Stringer(version.Version))
+	stats.General.Set("version", stats.Stringer(LastGitTag))
 
 	// web API
 	if activeConfig.API.Enabled {
@@ -115,45 +161,40 @@ func startService() {
 		server.Logger(log),
 		server.Config(activeConfig),
 	)
-
 	if err != nil {
 		log.Error().Err(err).Msg("could not create server")
 		os.Exit(1)
 	}
 
 	if activeConfig.LDAP.Enabled {
-		go func() {
+		// Don't block if also starting a LDAPS server afterwards
+		shouldBlock := !activeConfig.LDAPS.Enabled
+
+		if shouldBlock {
 			if err := s.ListenAndServe(); err != nil {
 				log.Error().Err(err).Msg("could not start LDAP server")
 				os.Exit(1)
 			}
-		}()
+		} else {
+			go func() {
+				if err := s.ListenAndServe(); err != nil {
+					log.Error().Err(err).Msg("could not start LDAP server")
+					os.Exit(1)
+				}
+			}()
+		}
 	}
 
 	if activeConfig.LDAPS.Enabled {
-		go func() {
-			if err := s.ListenAndServeTLS(); err != nil {
-				log.Error().Err(err).Msg("could not start LDAPS server")
-				os.Exit(1)
-			}
-		}()
+		// Always block here
+		if err := s.ListenAndServeTLS(); err != nil {
+			log.Error().Err(err).Msg("could not start LDAPS server")
+			os.Exit(1)
+		}
 	}
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-	// Block until we receive our signal.
-	<-c
-
-	// Doesn't block if no connections, but will otherwise wait
-	// until the timeout deadline.
-	s.Shutdown()
-
-	// Optionally, you could run srv.Shutdown in a goroutine and block on
-	// <-ctx.Done() if your application should wait for other services
-	// to finalize based on context cancellation.
 	log.Info().Msg("AP exit")
-	os.Exit(0)
+	os.Exit(1)
 }
 
 func startConfigWatcher() {
@@ -209,7 +250,7 @@ func startConfigWatcher() {
 func parseArgs() error {
 	var err error
 
-	if args, err = docopt.Parse(usage, nil, true, version.GetVersion(), false); err != nil {
+	if args, err = docopt.Parse(usage, nil, true, getVersionString(), false); err != nil {
 		return err
 	}
 

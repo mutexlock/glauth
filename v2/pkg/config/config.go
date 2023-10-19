@@ -91,12 +91,15 @@ type User struct {
 	SN            string
 	Homedir       string
 	CustomAttrs   map[string]interface{}
+	Tenant        string
+	Syncer        bool
 }
 type Group struct {
 	Name          string
 	UnixID        int // TODO: remove after deprecating UnixID on User and Group
 	GIDNumber     int
 	IncludeGroups []int
+	Tenant        string
 }
 type Config struct {
 	API                API
@@ -115,8 +118,13 @@ type Config struct {
 	LDAPS              LDAPS
 	Groups             []Group
 	Users              []User
+	Tenants            []Tenant
 	ConfigFile         string
 	AwsAccessKeyId     string
 	AwsSecretAccessKey string
 	AwsRegion          string
+}
+
+type Tenant struct {
+	Name string
 }
